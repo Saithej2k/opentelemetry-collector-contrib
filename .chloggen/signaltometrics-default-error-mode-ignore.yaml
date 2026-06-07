@@ -1,0 +1,6 @@
+change_type: enhancement
+component: connector/signal_to_metrics
+note: Change the default `error_mode` from `propagate` to `ignore`, gated by `connector.signaltometrics.defaultErrorModeIgnore`.
+issues: [48419]
+subtext:
+change_logs: [user]

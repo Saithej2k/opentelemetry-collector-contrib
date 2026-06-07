@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/collector/connector/xconnector"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/featuregate"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -191,6 +192,108 @@ func TestConnectorWithProfiles(t *testing.T) {
 			assertAggregatedMetrics(t, expectedMetrics, next.AllMetrics()[0])
 		})
 	}
+}
+
+func TestDefaultErrorModeFeatureGate(t *testing.T) {
+	tests := []struct {
+		name          string
+		gateEnabled   bool
+		expectedMode  ottl.ErrorMode
+		expectError   bool
+		expectLogs    bool
+		expectMetrics bool
+	}{
+		{
+			name:          "enabled ignores OTTL errors and preserves valid telemetry",
+			gateEnabled:   true,
+			expectedMode:  ottl.IgnoreError,
+			expectLogs:    true,
+			expectMetrics: true,
+		},
+		{
+			name:         "disabled propagates OTTL errors",
+			gateEnabled:  false,
+			expectedMode: ottl.PropagateError,
+			expectError:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setDefaultErrorModeIgnoreFeatureGate(t, tt.gateEnabled)
+
+			observedZapCore, observedLogs := observer.New(zap.InfoLevel)
+			settings := connectortest.NewNopSettings(metadata.Type)
+			settings.Logger = zap.New(observedZapCore)
+
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig().(*config.Config)
+			require.Equal(t, tt.expectedMode, cfg.ErrorMode)
+			cfg.Logs = []config.MetricInfo{
+				{
+					Name:        "test.sum",
+					Description: "Test sum",
+					Sum: configoptional.Some(config.Sum{
+						Value: `Int(log.attributes["value"])`,
+					}),
+				},
+			}
+
+			next := &consumertest.MetricsSink{}
+			conn, err := factory.CreateLogsToMetrics(t.Context(), settings, cfg, next)
+			require.NoError(t, err)
+
+			logs := plog.NewLogs()
+			logRecords := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords()
+			logRecords.AppendEmpty().Attributes().PutStr("value", "not-a-number")
+			logRecords.AppendEmpty().Attributes().PutInt("value", 7)
+
+			err = conn.ConsumeLogs(t.Context(), logs)
+			if tt.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tt.expectLogs {
+				assert.Positive(t, observedLogs.Len(), "expected error to be logged")
+			} else {
+				assert.Empty(t, observedLogs.All(), "expected no logs")
+			}
+
+			if tt.expectMetrics {
+				require.Len(t, next.AllMetrics(), 1)
+				assertSingleSumValue(t, next.AllMetrics()[0], "test.sum", 7)
+			} else {
+				assert.Empty(t, next.AllMetrics(), "expected no metrics")
+			}
+		})
+	}
+}
+
+func setDefaultErrorModeIgnoreFeatureGate(t *testing.T, enabled bool) {
+	t.Helper()
+
+	prev := metadata.ConnectorSignaltometricsDefaultErrorModeIgnoreFeatureGate.IsEnabled()
+	require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ConnectorSignaltometricsDefaultErrorModeIgnoreFeatureGate.ID(), enabled))
+	t.Cleanup(func() {
+		require.NoError(t, featuregate.GlobalRegistry().Set(metadata.ConnectorSignaltometricsDefaultErrorModeIgnoreFeatureGate.ID(), prev))
+	})
+}
+
+func assertSingleSumValue(t *testing.T, metrics pmetric.Metrics, name string, value int64) {
+	t.Helper()
+
+	require.Equal(t, 1, metrics.ResourceMetrics().Len())
+	scopeMetrics := metrics.ResourceMetrics().At(0).ScopeMetrics()
+	require.Equal(t, 1, scopeMetrics.Len())
+	metricSlice := scopeMetrics.At(0).Metrics()
+	require.Equal(t, 1, metricSlice.Len())
+	metric := metricSlice.At(0)
+	require.Equal(t, name, metric.Name())
+	dataPoints := metric.Sum().DataPoints()
+	require.Equal(t, 1, dataPoints.Len())
+	assert.Equal(t, value, dataPoints.At(0).IntValue())
 }
 
 type benchCase struct {
